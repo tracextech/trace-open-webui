@@ -1,0 +1,134 @@
+# Builds the image and rolls out tracex-gpt on the dev RKE2 cluster.
+#
+# Modelled on final_test/.github/workflows/deploy-qa.yml. Differences from that
+# template are commented inline — each is driven by something specific to this
+# application rather than preference.
+#
+# The Helm chart that defines the deployment lives in the cleara-k8s repo at
+# tracex-gpt-charts/tracex-gpt. This workflow only builds the image and
+# restarts the existing deployment; it does not install or upgrade the chart.
+
+name: Build & Deploy (Dev)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: "Log level"
+        required: false
+        default: "warning"
+
+env:
+  AWS_ECR_REPOSITORY: tracex/gpt
+  k8S_DEPLOYMENT_NAME: tracex-gpt
+  k8S_DEPLOYMENT_NAMESPACE: tracex-gpt
+
+jobs:
+  build-and-push:
+    name: Build & Push Image to ECR
+    runs-on: ubuntu-latest
+    # Open WebUI is a far heavier build than the Go services this template came
+    # from: a full SvelteKit frontend compile plus Python dependencies plus a
+    # bundled sentence-transformers embedding model. The reference workflow's
+    # 30 minutes is not enough for a cold cache.
+    timeout-minutes: 90
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME_DEV }}
+      AWS_EKS_REGION: ${{ secrets.AWS_EKS_REGION_DEV }}
+
+    steps:
+      - name: 🧾 Checkout Code
+        uses: actions/checkout@v4
+
+      - name: 🧹 Free Disk Space
+        # The runner has ~14 GB free by default. This image pulls a large Python
+        # ML dependency tree and the embedding model, and the build fails with a
+        # confusing "no space left on device" partway through without this.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - name: 🔐 Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_EKS_REGION }}
+
+      - name: 🐳 Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🧱 Cache Docker Layer Cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          # Keyed on the dependency manifests that actually invalidate layers.
+          # The reference used go.mod, which does not exist in this repo — left
+          # as-is it would produce a key that never changes and serve a stale
+          # cache after dependency bumps.
+          key: ${{ runner.os }}-buildx-${{ github.ref_name }}-${{ hashFiles('Dockerfile', 'package-lock.json', 'pyproject.toml', 'backend/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ github.ref_name }}-
+
+      - name: 🔑 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🏗️ Build & Push Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker buildx build \
+            --progress=plain \
+            --cache-from=type=local,src=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --build-arg BUILD_HASH=${{ github.sha }} \
+            --build-arg USE_CUDA=false \
+            --build-arg USE_OLLAMA=false \
+            --tag $ECR_REGISTRY/${{ env.AWS_ECR_REPOSITORY }}:latest \
+            --tag $ECR_REGISTRY/${{ env.AWS_ECR_REPOSITORY }}:${{ github.sha }} \
+            --push .
+
+      - name: 🔁 Update Docker Cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: 📦 Save Updated Docker Cache
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.ref_name }}-${{ hashFiles('Dockerfile', 'package-lock.json', 'pyproject.toml', 'backend/requirements.txt') }}
+
+  deploy:
+    name: Rollout to Tracex Cluster
+    needs: build-and-push
+    runs-on: tracex-k8s
+    timeout-minutes: 20
+
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ github.ref_name }}
+      cancel-in-progress: false
+
+    steps:
+      - name: 🚀 Restart K8s Deployment
+        run: |
+          kubectl rollout restart deploy $k8S_DEPLOYMENT_NAME -n $k8S_DEPLOYMENT_NAMESPACE
+
+      - name: ✅ Verify Deployment
+        # Longer than the reference 5m for two reasons: the Deployment uses
+        # strategy Recreate (the old pod must fully release the ReadWriteOnce
+        # volume before the new one can mount it), and first boot runs database
+        # migrations and loads the embedding model before /health passes.
+        run: |
+          kubectl rollout status deployment/$k8S_DEPLOYMENT_NAME \
+            -n $k8S_DEPLOYMENT_NAMESPACE --timeout=15m
